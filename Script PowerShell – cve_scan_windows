@@ -1,0 +1,163 @@
+C:\Program Files (x86)\ossec-agent\custom-scripts\cve_scan_windows.ps1
+
+<#
+    cve_scan_windows.ps1
+    Script de consulta de vulnerabilidades (CVE) para agentes Windows.
+
+    - Consulta API pública do cve.circl.lu
+    - Filtra CVEs por CVSS mínimo
+    - Limita quantidade por termo
+    - Verifica janela de anos
+    - Gera logs compatíveis com o Wazuh:
+        WAZUH_CVE_HIT
+        WAZUH_CVE_ERROR
+        WAZUH_CVE_DONE
+#>
+
+param (
+    [Parameter(Mandatory=$true)]
+    [string[]] $terms,
+
+    [double] $min_cvss = 0.0,
+    [int] $years = 10,
+    [int] $max_per = 20,
+    [int] $timeout = 15
+)
+
+# Diretório e arquivo de log
+$logDir  = "C:\Program Files (x86)\ossec-agent\custom-scripts\logs"
+$logFile = Join-Path $logDir "cve_lookup.log"
+
+# Garante que o diretório existe
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+}
+
+function Write-LogLine {
+    param([string] $line)
+    try {
+        Add-Content -Path $logFile -Value $line
+    }
+    catch {
+        Write-Host "Erro ao escrever log: $_"
+    }
+}
+
+function Get-PublishedDate {
+    param([object] $entry)
+
+    $dateFields = @("Published", "published", "Modified", "modified")
+
+    foreach ($f in $dateFields) {
+        if ($entry.$f) {
+            try {
+                return [datetime]$entry.$f
+            }
+            catch { continue }
+        }
+    }
+    return $null
+}
+
+function Is-WithinYears {
+    param(
+        [datetime] $date,
+        [int] $years
+    )
+
+    if ($date -eq $null) { return $false }
+
+    $now = Get-Date
+    $diffYears = ($now - $date).Days / 365.25
+
+    return ($diffYears -le $years)
+}
+
+function Sanitize-Summary {
+    param([string]$summary)
+
+    if (-not $summary) { return "" }
+
+    $clean = $summary.Replace("`r"," ").Replace("`n"," ")
+    if ($clean.Length -gt 300) {
+        return $clean.Substring(0,297) + "..."
+    }
+    return $clean
+}
+
+function Process-Term {
+    param(
+        [string] $term,
+        [double] $min_cvss,
+        [int] $years,
+        [int] $max_per,
+        [int] $timeout
+    )
+
+    $hits = 0
+    $url = "https://cve.circl.lu/api/search/$term"
+
+    try {
+        $response = Invoke-WebRequest -Uri $url -TimeoutSec $timeout
+        $data = $response.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-LogLine "WAZUH_CVE_ERROR term=""$term"" error=""$($_.Exception.Message)"""
+        return 0
+    }
+
+    foreach ($entry in $data) {
+
+        if ($hits -ge $max_per) { break }
+
+        $cve_id = $entry.id
+        if (-not $cve_id) { continue }
+
+        # Extrai CVSS
+        $cvss = $null
+        if ($entry.cvss) { $cvss = [double]$entry.cvss }
+        elseif ($entry.cvss3) { $cvss = [double]$entry.cvss3 }
+
+        if ($cvss -eq $null -or $cvss -lt $min_cvss) {
+            continue
+        }
+
+        # Data de publicação
+        $published = Get-PublishedDate -entry $entry
+        if (-not (Is-WithinYears -date $published -years $years)) {
+            continue
+        }
+
+        # Resumo sanitizado
+        $summary = Sanitize-Summary $entry.summary
+
+        $pubStr = ""
+        if ($published) { $pubStr = $published.ToString("s") }
+
+        # Linha no log
+        $line = "WAZUH_CVE_HIT term=""$term"" id=""$cve_id"" cvss=""$cvss"" published=""$pubStr"" summary=""$summary"""
+        Write-LogLine $line
+
+        $hits++
+    }
+
+    return $hits
+}
+
+# Execução principal
+$totalTerms = 0
+$totalHits  = 0
+
+foreach ($t in $terms) {
+    $totalTerms++
+    $t = $t.Trim()
+    if ($t -eq "") { continue }
+
+    $h = Process-Term -term $t -min_cvss $min_cvss -years $years -max_per $max_per -timeout $timeout
+    $totalHits += $h
+
+    Start-Sleep -Seconds 1
+}
+
+# Linha final de resumo
+Write-LogLine "WAZUH_CVE_DONE terms=""$totalTerms"" hits=""$totalHits"" min_cvss=""$min_cvss"" years=""$years"" max_per=""$max_per"""

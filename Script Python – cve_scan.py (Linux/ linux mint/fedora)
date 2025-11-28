@@ -1,0 +1,315 @@
+/var/ossec/custom-scripts/cve_scan.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cve_scan.py
+Script para consulta de CVEs em fontes públicas e geração de log
+compatível com o Wazuh.
+
+- Consulta a API do cve.circl.lu
+- Filtra por CVSS mínimo
+- Limita a quantidade de CVEs por termo e janela de anos
+- Gera log em formato texto com prefixos:
+  - WAZUH_CVE_HIT   (resultado válido)
+  - WAZUH_CVE_ERROR (erro na consulta ou processamento)
+  - WAZUH_CVE_DONE  (resumo da execução)
+
+Autor(es): Autores do TCC
+"Ernesto Brito e Diego Yuta"
+
+import argparse
+import datetime as dt
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+
+# =========================
+# Configurações gerais
+# =========================
+
+API_BASE = "https://cve.circl.lu/api/search"
+LOG_DIR = Path("/var/ossec/custom-scripts/logs")
+LOG_FILE = LOG_DIR / "cve_lookup.log"
+
+DEFAULT_MIN_CVSS = 0.0
+DEFAULT_YEARS = 10
+DEFAULT_MAX_PER = 20
+DEFAULT_TIMEOUT = 15
+DEFAULT_SLEEP = 1.0  # segundos entre requisições
+
+
+# =========================
+# Funções utilitárias
+# =========================
+
+def ensure_log_dir() -> None:
+    """
+    Garante que o diretório de logs exista.
+    Não levanta exceção caso não seja possível criar, apenas segue.
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Em último caso, o script ainda tentará escrever no caminho,
+        # e o erro será registrado pelo WAZUH_CVE_ERROR.
+        pass
+
+
+def write_log_line(line: str) -> None:
+    """
+    Escreve uma linha no arquivo de log, garantindo append.
+    """
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+    except Exception as exc:
+        # Se não conseguir escrever no arquivo, tenta pelo menos enviar ao stdout
+        sys.stderr.write(f"[WRITE-ERROR] {exc}\n")
+
+
+def sanitize_summary(summary: str, max_len: int = 300) -> str:
+    """
+    Normaliza o texto de resumo da vulnerabilidade:
+    - remove quebras de linha
+    - limita tamanho máximo
+    - remove caracteres de controle básicos
+    """
+    if not summary:
+        return ""
+    s = summary.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > max_len:
+        s = s[: max_len - 3].rstrip() + "..."
+    return s
+
+
+def extract_cvss(entry: Dict[str, Any]) -> Optional[float]:
+    """
+    Tenta obter o valor de CVSS do dicionário retornado pela API.
+    Dá preferência a valores numéricos simples; caso não exista, retorna None.
+    """
+    # Alguns formatos retornam 'cvss'
+    if "cvss" in entry and entry["cvss"] is not None:
+        try:
+            return float(entry["cvss"])
+        except (TypeError, ValueError):
+            pass
+
+    # Em versões mais novas pode existir metadados de CVSSv3
+    metrics = entry.get("cvss3") or entry.get("cvss_v3") or entry.get("cvssV3")
+    if metrics:
+        try:
+            if isinstance(metrics, (int, float)):
+                return float(metrics)
+            if isinstance(metrics, str):
+                return float(metrics)
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def extract_published_date(entry: Dict[str, Any]) -> Optional[dt.datetime]:
+    """
+    Tenta obter a data de publicação (published/Published) e convertê-la
+    para datetime.
+    """
+    raw = entry.get("Published") or entry.get("published") or entry.get("Modified") or entry.get("modified")
+    if not raw:
+        return None
+
+    # Tenta alguns formatos comuns
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(raw[:19], fmt)
+        except ValueError:
+            continue
+
+    # Se não conseguir converter, retorna None
+    return None
+
+
+def is_within_years(published: Optional[dt.datetime], years: int) -> bool:
+    """
+    Verifica se a vulnerabilidade está dentro da janela de 'years' anos
+    em relação à data atual.
+    """
+    if published is None:
+        return False
+    now = dt.datetime.now(dt.timezone.utc)
+    delta_years = (now - published.replace(tzinfo=dt.timezone.utc)).days / 365.25
+    return delta_years <= years
+
+
+def query_cve_api(term: str, timeout: int = DEFAULT_TIMEOUT) -> List[Dict[str, Any]]:
+    """
+    Consulta a API do cve.circl.lu para um termo específico.
+    Retorna uma lista de dicionários de CVEs ou levanta exceção.
+    """
+    url = f"{API_BASE}/{term}"
+    resp = requests.get(url, timeout=timeout)
+    if not resp.ok:
+        raise RuntimeError(f"HTTP {resp.status_code} ao consultar {url}")
+    try:
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Falha ao decodificar JSON: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise RuntimeError("Resposta inesperada da API (não é lista).")
+
+    return data
+
+
+# =========================
+# Lógica principal
+# =========================
+
+def process_term(
+    term: str,
+    min_cvss: float,
+    years: int,
+    max_per: int,
+    timeout: int,
+) -> int:
+    """
+    Processa um termo de busca:
+    - consulta a API
+    - filtra por CVSS, anos e limite por termo
+    - grava linhas WAZUH_CVE_HIT no log
+
+    Retorna o número de CVEs registrados.
+    """
+    hits = 0
+
+    try:
+        entries = query_cve_api(term, timeout=timeout)
+    except Exception as exc:
+        msg = f'WAZUH_CVE_ERROR term="{term}" error="{str(exc).replace("\"", "\'")}"'
+        write_log_line(msg)
+        return 0
+
+    for entry in entries:
+        if hits >= max_per:
+            break
+
+        cve_id = entry.get("id") or entry.get("cve") or ""
+        if not cve_id:
+            continue
+
+        cvss = extract_cvss(entry)
+        if cvss is None or cvss < min_cvss:
+            continue
+
+        published = extract_published_date(entry)
+        if not is_within_years(published, years):
+            continue
+
+        summary = sanitize_summary(entry.get("summary") or entry.get("description") or "")
+        published_str = published.isoformat() if published else ""
+
+        line = (
+            f'WAZUH_CVE_HIT term="{term}" '
+            f'id="{cve_id}" '
+            f'cvss="{cvss:.1f}" '
+            f'published="{published_str}" '
+            f'summary="{summary}"'
+        )
+        write_log_line(line)
+        hits += 1
+
+    return hits
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Consulta CVEs em base pública (cve.circl.lu) e grava resultados "
+            "em log compatível com o Wazuh."
+        )
+    )
+
+    parser.add_argument(
+        "terms",
+        nargs="+",
+        help="Termos a serem pesquisados (ex.: openssl 'linux kernel' nginx).",
+    )
+    parser.add_argument(
+        "--min-cvss",
+        type=float,
+        default=DEFAULT_MIN_CVSS,
+        help=f"Score CVSS mínimo (padrão: {DEFAULT_MIN_CVSS}).",
+    )
+    parser.add_argument(
+        "--years",
+        type=int,
+        default=DEFAULT_YEARS,
+        help=f"Janela de anos a considerar a partir da data atual (padrão: {DEFAULT_YEARS}).",
+    )
+    parser.add_argument(
+        "--max-per",
+        type=int,
+        default=DEFAULT_MAX_PER,
+        help=f"Número máximo de CVEs por termo (padrão: {DEFAULT_MAX_PER}).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Timeout em segundos para chamadas HTTP (padrão: {DEFAULT_TIMEOUT}).",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=DEFAULT_SLEEP,
+        help=f"Pausa em segundos entre chamadas à API (padrão: {DEFAULT_SLEEP}).",
+    )
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ensure_log_dir()
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    total_hits = 0
+    total_terms = 0
+
+    for term in args.terms:
+        term = term.strip()
+        if not term:
+            continue
+
+        total_terms += 1
+        hits = process_term(
+            term=term,
+            min_cvss=args.min_cvss,
+            years=args.years,
+            max_per=args.max_per,
+            timeout=args.timeout,
+        )
+        total_hits += hits
+
+        # Evita sobrecarga na API
+        time.sleep(max(args.sleep, 0.0))
+
+    # Linha de resumo final
+    done_line = (
+        f'WAZUH_CVE_DONE terms="{total_terms}" '
+        f'hits="{total_hits}" '
+        f'min_cvss="{args.min_cvss}" '
+        f'years="{args.years}" '
+        f'max_per="{args.max_per}"'
+    )
+    write_log_line(done_line)
+
+    # Retorna 0 sempre, para não quebrar agendamento em cron/systemd
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
